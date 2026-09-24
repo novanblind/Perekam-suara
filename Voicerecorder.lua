@@ -49,7 +49,7 @@ import "org.json.JSONObject"
 local mainHandler = Handler(Looper.getMainLooper())
 
 local APP_TITLE = "Perekam Suara by Novan"
-local SCRIPT_VERSION = "1.1"
+local SCRIPT_VERSION = "1.2"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Perekam-suara/main/Voicerecorder.lua"
 
 -- Status runtime perekam & pemutar
@@ -451,30 +451,51 @@ checkForUpdate = function()
               .setMessage(string.format("Versi saat ini: %s\nVersi baru: %s\n\nApakah Anda ingin memperbarui script ini sekarang?", SCRIPT_VERSION, tostring(remoteVersion or "Baru")))
               .setPositiveButton("Perbarui Sekarang", function()
                 triggerVibration(1.0)
-                local targetFile = getCurrentScriptFile()
-                local updated = false
-                if targetFile and targetFile.canWrite() then
-                  pcall(function()
-                    local fos = FileOutputStream(targetFile)
-                    fos.write(String(responseText).getBytes("UTF-8"))
-                    fos.flush()
-                    fos.close()
-                    updated = true
-                  end)
-                end
+                service.speak("Sedang mengunduh pembaruan...")
 
-                if updated then
-                  service.speak("Pembaruan berhasil dipasang. Silakan jalankan ulang script.")
-                else
-                  local backupFile = File(getRecordingsDir(), "Voicerecorder_Update.lua")
-                  pcall(function()
-                    local fos = FileOutputStream(backupFile)
-                    fos.write(String(responseText).getBytes("UTF-8"))
-                    fos.flush()
-                    fos.close()
-                  end)
-                  service.speak("Script baru disimpan di folder rekaman dengan nama Voicerecorder_Update.lua")
-                end
+                Thread(Runnable{
+                  run = function()
+                    local targetFile = getCurrentScriptFile()
+                    local updated = false
+                    if targetFile and targetFile.canWrite() then
+                      pcall(function()
+                        local fos = FileOutputStream(targetFile)
+                        fos.write(String(responseText).getBytes("UTF-8"))
+                        fos.flush()
+                        fos.close()
+                        updated = true
+                      end)
+                    end
+
+                    local finishMessage = ""
+                    if updated then
+                      finishMessage = string.format("Pembaruan versi %s berhasil diunduh dan dipasang.\n\nSilakan jalankan ulang script untuk menerapkan perubahan.", tostring(remoteVersion or "baru"))
+                    else
+                      local backupFile = File(getRecordingsDir(), "Voicerecorder_Update.lua")
+                      pcall(function()
+                        local fos = FileOutputStream(backupFile)
+                        fos.write(String(responseText).getBytes("UTF-8"))
+                        fos.flush()
+                        fos.close()
+                      end)
+                      finishMessage = string.format("Pembaruan versi %s selesai diunduh dan disimpan di:\n%s", tostring(remoteVersion or "baru"), tostring(backupFile.getAbsolutePath()))
+                    end
+
+                    mainHandler.post(Runnable{
+                      run = function()
+                        triggerVibration(1.2)
+                        service.speak("Pengunduhan selesai.")
+                        local doneBuilder = AlertDialog.Builder(service)
+                          .setTitle("Unduhan Selesai")
+                          .setMessage(finishMessage)
+                          .setPositiveButton("OK", function()
+                            triggerVibration(1.0)
+                          end)
+                        displayOverlayDialog(doneBuilder)
+                      end
+                    })
+                  end
+                }).start()
               end)
               .setNeutralButton("Buka Tautan", function()
                 triggerVibration(1.0)
@@ -1905,7 +1926,7 @@ showSettingsDialog = function()
   }
 
   local builder = AlertDialog.Builder(service)
-    .setTitle("Pengaturan Rekaman")
+    .setTitle("Pengaturan Perekam Suara (v" .. SCRIPT_VERSION .. ")")
     .setItems(settingsItems, function(dialog, which)
       dialog.dismiss()
       triggerVibration(1.0)
