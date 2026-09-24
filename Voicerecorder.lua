@@ -34,8 +34,11 @@ import "java.io.FileInputStream"
 import "java.io.RandomAccessFile"
 import "java.io.BufferedReader"
 import "java.io.InputStreamReader"
+import "java.net.URL"
+import "java.net.HttpURLConnection"
 import "java.lang.Thread"
 import "java.lang.Runnable"
+import "java.lang.String"
 import "java.lang.reflect.Array"
 import "java.lang.Byte"
 import "java.text.SimpleDateFormat"
@@ -46,6 +49,8 @@ import "org.json.JSONObject"
 local mainHandler = Handler(Looper.getMainLooper())
 
 local APP_TITLE = "Perekam Suara by Novan"
+local SCRIPT_VERSION = "1.1"
+local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Perekam-suara/main/Voicerecorder.lua"
 
 -- Status runtime perekam & pemutar
 _G.voiceRecorderState = _G.voiceRecorderState or {
@@ -307,6 +312,7 @@ local showResetConfirmDialog
 local showRecordedFileActionDialog
 local showPauseDialog
 local showHistoryDialog
+local checkForUpdate
 local stopRecording
 local startRecording
 
@@ -333,6 +339,161 @@ local function setupAutoStopTimer()
     }
     mainHandler.postDelayed(state.timerRunnable, timerSec * 1000)
   end
+end
+
+-- Helper Pembaruan Script
+local function getCurrentScriptFile()
+  local info = debug.getinfo(1, "S")
+  if info and info.source and info.source:sub(1, 1) == "@" then
+    local path = info.source:sub(2)
+    local f = File(path)
+    if f.exists() and f.isFile() then
+      return f
+    end
+  end
+  return nil
+end
+
+local function compareVersions(v1, v2)
+  local p1 = {}
+  for num in tostring(v1):gmatch("%d+") do table.insert(p1, tonumber(num)) end
+  local p2 = {}
+  for num in tostring(v2):gmatch("%d+") do table.insert(p2, tonumber(num)) end
+  local len = math.max(#p1, #p2)
+  for i = 1, len do
+    local n1 = p1[i] or 0
+    local n2 = p2[i] or 0
+    if n1 > n2 then return 1 end
+    if n1 < n2 then return -1 end
+  end
+  return 0
+end
+
+local function openUrlInBrowser(urlStr)
+  pcall(function()
+    local intent = Intent(Intent.ACTION_VIEW, Uri.parse(urlStr))
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    service.startActivity(intent)
+  end)
+end
+
+checkForUpdate = function()
+  service.speak("Memeriksa versi baru...")
+  triggerVibration(0.8)
+
+  Thread(Runnable{
+    run = function()
+      local success = false
+      local responseText = nil
+      local errMsg = nil
+
+      pcall(function()
+        local url = URL(UPDATE_URL)
+        local conn = url.openConnection()
+        conn.setRequestMethod("GET")
+        conn.setConnectTimeout(10000)
+        conn.setReadTimeout(10000)
+        conn.setUseCaches(false)
+        conn.setRequestProperty("User-Agent", "Mozilla/5.0 (Android)")
+        conn.connect()
+
+        local responseCode = conn.getResponseCode()
+        if responseCode == 200 then
+          local is = conn.getInputStream()
+          local reader = BufferedReader(InputStreamReader(is, "UTF-8"))
+          local sb = {}
+          local line = reader.readLine()
+          while line ~= nil do
+            table.insert(sb, line)
+            line = reader.readLine()
+          end
+          reader.close()
+          is.close()
+          responseText = table.concat(sb, "\n")
+          success = true
+        else
+          errMsg = "HTTP " .. responseCode
+        end
+        conn.disconnect()
+      end)
+
+      mainHandler.post(Runnable{
+        run = function()
+          if not success or not responseText or responseText == "" then
+            triggerVibration(1.0)
+            service.speak("Gagal memeriksa pembaruan. Pastikan ada koneksi internet.")
+            return
+          end
+
+          local remoteVersion = responseText:match('SCRIPT_VERSION%s*=%s*"([^"]+)"')
+            or responseText:match('CURRENT_VERSION%s*=%s*"([^"]+)"')
+            or responseText:match('VERSION%s*=%s*"([^"]+)"')
+
+          local hasUpdate = false
+          if remoteVersion then
+            hasUpdate = (compareVersions(remoteVersion, SCRIPT_VERSION) > 0)
+          else
+            local curFile = getCurrentScriptFile()
+            if curFile and curFile.exists() then
+              if math.abs(curFile.length() - #responseText) > 10 then
+                hasUpdate = true
+                remoteVersion = "Terbaru (Online)"
+              end
+            end
+          end
+
+          if hasUpdate then
+            triggerVibration(1.2)
+            service.speak("Versi baru ditemukan: " .. tostring(remoteVersion or "Terbaru"))
+
+            local updateBuilder = AlertDialog.Builder(service)
+              .setTitle("Pembaruan Tersedia")
+              .setMessage(string.format("Versi saat ini: %s\nVersi baru: %s\n\nApakah Anda ingin memperbarui script ini sekarang?", SCRIPT_VERSION, tostring(remoteVersion or "Baru")))
+              .setPositiveButton("Perbarui Sekarang", function()
+                triggerVibration(1.0)
+                local targetFile = getCurrentScriptFile()
+                local updated = false
+                if targetFile and targetFile.canWrite() then
+                  pcall(function()
+                    local fos = FileOutputStream(targetFile)
+                    fos.write(String(responseText).getBytes("UTF-8"))
+                    fos.flush()
+                    fos.close()
+                    updated = true
+                  end)
+                end
+
+                if updated then
+                  service.speak("Pembaruan berhasil dipasang. Silakan jalankan ulang script.")
+                else
+                  local backupFile = File(getRecordingsDir(), "Voicerecorder_Update.lua")
+                  pcall(function()
+                    local fos = FileOutputStream(backupFile)
+                    fos.write(String(responseText).getBytes("UTF-8"))
+                    fos.flush()
+                    fos.close()
+                  end)
+                  service.speak("Script baru disimpan di folder rekaman dengan nama Voicerecorder_Update.lua")
+                end
+              end)
+              .setNeutralButton("Buka Tautan", function()
+                triggerVibration(1.0)
+                openUrlInBrowser(UPDATE_URL)
+              end)
+              .setNegativeButton("Nanti", function()
+                showSettingsDialog()
+              end)
+
+            displayOverlayDialog(updateBuilder)
+          else
+            triggerVibration(0.8)
+            service.speak("Anda sudah menggunakan versi terbaru (v" .. SCRIPT_VERSION .. ").")
+            showSettingsDialog()
+          end
+        end
+      })
+    end
+  }).start()
 end
 
 -- Buka File Manager Plus langsung ke folder penyimpanan rekaman
@@ -1739,7 +1900,8 @@ showSettingsDialog = function()
     "8. Timer Batas Rekam (Aktif: " .. timerLabel .. ")",
     "9. Aksi Penghentian (Aktif: " .. stopBehaviorLabel .. ")",
     "10. Intensitas Getaran (Aktif: " .. vibLevel .. ")",
-    "11. Reset Semua Pengaturan ke Default"
+    "11. Periksa Versi Baru",
+    "12. Reset Semua Pengaturan ke Default"
   }
 
   local builder = AlertDialog.Builder(service)
@@ -1757,7 +1919,8 @@ showSettingsDialog = function()
       elseif which == 7 then showRecordTimerDialog()
       elseif which == 8 then showStopBehaviorDialog()
       elseif which == 9 then showVibrationDialog()
-      elseif which == 10 then showResetConfirmDialog()
+      elseif which == 10 then checkForUpdate()
+      elseif which == 11 then showResetConfirmDialog()
       end
     end)
     .setNegativeButton("Tutup", nil)
