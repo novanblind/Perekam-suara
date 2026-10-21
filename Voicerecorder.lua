@@ -4,10 +4,14 @@ import "android.media.MediaPlayer"
 import "android.media.AudioManager"
 import "android.media.AudioRecord"
 import "android.media.AudioFormat"
+import "android.media.ToneGenerator"
 import "android.media.audiofx.AutomaticGainControl"
+import "android.media.audiofx.AcousticEchoCanceler"
+import "android.media.audiofx.NoiseSuppressor"
 import "android.os.Environment"
 import "android.os.Handler"
 import "android.os.Looper"
+import "android.os.SystemClock"
 import "android.app.AlertDialog"
 import "android.widget.EditText"
 import "android.widget.TextView"
@@ -49,7 +53,7 @@ import "org.json.JSONObject"
 local mainHandler = Handler(Looper.getMainLooper())
 
 local APP_TITLE = "Perekam Suara by Novan"
-local SCRIPT_VERSION = "1.2"
+local SCRIPT_VERSION = "1.3"
 local UPDATE_URL = "https://raw.githubusercontent.com/novanblind/Perekam-suara/main/Voicerecorder.lua"
 
 -- Status runtime perekam & pemutar
@@ -58,7 +62,13 @@ _G.voiceRecorderState = _G.voiceRecorderState or {
   audioRecord = nil,
   recordThread = nil,
   agcEffect = nil,
+  aecEffect = nil,
+  nsEffect = nil,
   timerRunnable = nil,
+  countdownRunnable = nil,
+  isCountingDown = false,
+  accumMs = 0,
+  lastTick = nil,
   isWav = false,
   pcmTotalBytes = 0,
   pcmSampleRate = 44100,
@@ -67,6 +77,7 @@ _G.voiceRecorderState = _G.voiceRecorderState or {
   isRecording = false,
   isPaused = false,
   isPlaying = false,
+  isTestingMic = false,
   currentFilePath = nil,
   lastRecordedPath = nil
 }
@@ -176,12 +187,105 @@ local function setVibrationLevel(v) savePref("vibration_level", tostring(v)) end
 local function getRecordPrefix() return loadPref("record_prefix", "REC") end
 local function setRecordPrefix(p) savePref("record_prefix", tostring(p)) end
 
+-- Pengaturan tambahan (v1.3)
+local function getMicType() return loadPref("mic_type", "mic") end
+local function setMicType(t) savePref("mic_type", tostring(t)) end
+
+local function getInputGainDb() return tonumber(loadPref("input_gain_db", "0")) or 0 end
+local function setInputGainDb(g) savePref("input_gain_db", tostring(g)) end
+
+local function getEchoCancel() return loadPref("echo_cancel", "false") == "true" end
+local function setEchoCancel(e) savePref("echo_cancel", tostring(e)) end
+
+local function getBufferMult() return tonumber(loadPref("buffer_mult", "2")) or 2 end
+local function setBufferMult(m) savePref("buffer_mult", tostring(m)) end
+
+local function getCountdownSeconds() return tonumber(loadPref("countdown_sec", "0")) or 0 end
+local function setCountdownSeconds(s) savePref("countdown_sec", tostring(s)) end
+
+local function getBeep() return loadPref("beep_enabled", "false") == "true" end
+local function setBeep(b) savePref("beep_enabled", tostring(b)) end
+
+local function getAnnounceDuration() return loadPref("announce_duration", "true") == "true" end
+local function setAnnounceDuration(a) savePref("announce_duration", tostring(a)) end
+
+-- Jenis mikrofon (sumber suara)
+local MIC_TYPES = {
+  { key = "mic", id = 1, label = "Mikrofon utama (standar)" },
+  { key = "voice_recognition", id = 6, label = "Pengenalan suara (fokus ke suara bicara)" },
+  { key = "voice_communication", id = 7, label = "Komunikasi (peredam gema bawaan HP)" },
+  { key = "camcorder", id = 5, label = "Mikrofon kamera (arah belakang)" },
+  { key = "unprocessed", id = 9, label = "Mentah tanpa pemrosesan (Android 7 ke atas)" }
+}
+
+local function getMicLabel(key)
+  for _, m in ipairs(MIC_TYPES) do
+    if m.key == key then return m.label end
+  end
+  return MIC_TYPES[1].label
+end
+
+-- Mengembalikan id sumber suara yang dipakai. Bila peredam bising aktif dan jenis
+-- mikrofon masih standar, dipakai sumber pengenalan suara (perilaku lama script ini).
+local function getMicSourceId()
+  local key = getMicType()
+  if key == "unprocessed" and Build.VERSION.SDK_INT < 24 then
+    return 1
+  end
+  if key == "mic" and getNoiseReduction() then
+    return 6
+  end
+  for _, m in ipairs(MIC_TYPES) do
+    if m.key == key then return m.id end
+  end
+  return 1
+end
+
 -- Helper Ukuran Berkas
 local function formatFileSize(sizeBytes)
   if not sizeBytes or sizeBytes <= 0 then return "0 B" end
   if sizeBytes < 1024 then return sizeBytes .. " B" end
   if sizeBytes < 1048576 then return string.format("%.1f KB", sizeBytes / 1024) end
   return string.format("%.2f MB", sizeBytes / 1048576)
+end
+
+-- Helper durasi
+local function formatDuration(ms)
+  local total = math.floor((ms or 0) / 1000)
+  local h = math.floor(total / 3600)
+  local m = math.floor((total % 3600) / 60)
+  local s = total % 60
+  local parts = {}
+  if h > 0 then table.insert(parts, h .. " jam") end
+  if m > 0 then table.insert(parts, m .. " menit") end
+  if s > 0 or #parts == 0 then table.insert(parts, s .. " detik") end
+  return table.concat(parts, " ")
+end
+
+local function formatTimerLabel(sec)
+  if sec == 0 then return "Nonaktif" end
+  if sec >= 3600 and sec % 3600 == 0 then return math.floor(sec / 3600) .. " Jam" end
+  return math.floor(sec / 60) .. " Menit"
+end
+
+local function elapsedMs()
+  local t = state.accumMs or 0
+  if state.isRecording and not state.isPaused and state.lastTick then
+    t = t + (SystemClock.elapsedRealtime() - state.lastTick)
+  end
+  return t
+end
+
+-- Bunyi penanda
+local function beep(tone, ms)
+  if not getBeep() then return end
+  pcall(function()
+    local tg = ToneGenerator(AudioManager.STREAM_MUSIC, 80)
+    tg.startTone(tone, ms)
+    mainHandler.postDelayed(Runnable{
+      run = function() pcall(function() tg.release() end) end
+    }, ms + 200)
+  end)
 end
 
 -- Audio Focus Management
@@ -201,6 +305,38 @@ local function abandonRecorderAudioFocus()
       am.abandonAudioFocus(nil)
     end
   end)
+end
+
+-- Efek audio (AGC, peredam gema, peredam bising) untuk jalur WAV
+local function releaseEffects()
+  for _, name in ipairs({"agcEffect", "aecEffect", "nsEffect"}) do
+    local fx = state[name]
+    if fx then
+      pcall(function()
+        fx.setEnabled(false)
+        fx.release()
+      end)
+      state[name] = nil
+    end
+  end
+end
+
+-- Penguatan suara masuk (dB) pada data PCM 16 bit little-endian
+local function applyGain(buf, n, mult)
+  for i = 0, n - 2, 2 do
+    local lo = buf[i]
+    local hi = buf[i + 1]
+    if lo < 0 then lo = lo + 256 end
+    local s = math.floor((hi * 256 + lo) * mult + 0.5)
+    if s > 32767 then s = 32767 elseif s < -32768 then s = -32768 end
+    if s < 0 then s = s + 65536 end
+    local nlo = s % 256
+    local nhi = math.floor(s / 256)
+    if nlo > 127 then nlo = nlo - 256 end
+    if nhi > 127 then nhi = nhi - 256 end
+    buf[i] = nlo
+    buf[i + 1] = nhi
+  end
 end
 
 -- Helper Header WAV
@@ -302,16 +438,23 @@ local showFormatDialog
 local showBitrateDialog
 local showSampleRateDialog
 local showChannelsDialog
+local showMicTypeDialog
+local showInputGainDialog
 local showNoiseReductionDialog
 local showGainControlDialog
+local showEchoCancelDialog
+local showBufferDialog
+local showCountdownDialog
 local showRecordTimerDialog
 local showStopBehaviorDialog
+local showBeepDialog
 local showVibrationDialog
 local showPrefixDialog
 local showResetConfirmDialog
 local showRecordedFileActionDialog
 local showPauseDialog
 local showHistoryDialog
+local checkMicLevel
 local checkForUpdate
 local stopRecording
 local startRecording
@@ -1122,6 +1265,7 @@ stopRecording = function()
     return
   end
 
+  local totalMs = elapsedMs()
   clearAutoStopTimer()
   state.isRecording = false
   state.isPaused = false
@@ -1131,13 +1275,7 @@ stopRecording = function()
   local ok = true
   local err = nil
 
-  if state.agcEffect then
-    pcall(function()
-      state.agcEffect.setEnabled(false)
-      state.agcEffect.release()
-    end)
-    state.agcEffect = nil
-  end
+  releaseEffects()
 
   if state.isWav then
     pcall(function()
@@ -1171,10 +1309,17 @@ stopRecording = function()
     end
   end
 
+  state.accumMs = totalMs
+  beep(ToneGenerator.TONE_PROP_PROMPT, 250)
+
   if ok and state.currentFilePath then
     state.lastRecordedPath = state.currentFilePath
     local recordedFile = File(state.currentFilePath)
-    service.speak("Rekaman selesai.")
+    local msg = "Rekaman selesai."
+    if getAnnounceDuration() then
+      msg = msg .. " Durasi " .. formatDuration(totalMs) .. "."
+    end
+    service.speak(msg)
     showRecordedFileActionDialog(recordedFile)
   else
     service.speak("Rekaman dihentikan, terdapat kendala berkas: " .. tostring(err))
@@ -1189,11 +1334,23 @@ local function pauseRecording()
     return
   end
 
-  if state.isWav then
+  local nowMs = elapsedMs()
+
+  local function afterPause()
+    state.accumMs = nowMs
     state.isPaused = true
     triggerVibration(1.0)
-    service.speak("Rekaman dijeda.")
+    beep(ToneGenerator.TONE_PROP_BEEP2, 120)
+    local msg = "Rekaman dijeda."
+    if getAnnounceDuration() then
+      msg = msg .. " Durasi " .. formatDuration(nowMs) .. "."
+    end
+    service.speak(msg)
     showPauseDialog()
+  end
+
+  if state.isWav then
+    afterPause()
     return
   end
 
@@ -1208,10 +1365,7 @@ local function pauseRecording()
   end)
 
   if ok then
-    state.isPaused = true
-    triggerVibration(1.0)
-    service.speak("Rekaman dijeda.")
-    showPauseDialog()
+    afterPause()
   else
     service.speak("Gagal menjeda rekaman. Menghentikan rekaman.")
     stopRecording()
@@ -1222,23 +1376,37 @@ end
 local function resumeRecording()
   if not state.isRecording or not state.isPaused then return end
 
-  if state.isWav then
-    state.isPaused = false
-    triggerVibration(1.0)
-    service.speak("Rekaman dilanjutkan.")
-    return
+  local function doResume()
+    if not state.isRecording or not state.isPaused then return end
+
+    if state.isWav then
+      state.isPaused = false
+      state.lastTick = SystemClock.elapsedRealtime()
+      triggerVibration(1.0)
+      service.speak("Rekaman dilanjutkan.")
+      return
+    end
+
+    local ok, err = pcall(function()
+      state.recorder.resume()
+    end)
+
+    if ok then
+      state.isPaused = false
+      state.lastTick = SystemClock.elapsedRealtime()
+      triggerVibration(1.0)
+      service.speak("Rekaman dilanjutkan.")
+    else
+      service.speak("Gagal melanjutkan rekaman: " .. tostring(err))
+    end
   end
 
-  local ok, err = pcall(function()
-    state.recorder.resume()
-  end)
-
-  if ok then
-    state.isPaused = false
-    triggerVibration(1.0)
-    service.speak("Rekaman dilanjutkan.")
+  if getBeep() then
+    -- Bunyi penanda dibunyikan lebih dulu supaya tidak ikut terekam
+    beep(ToneGenerator.TONE_PROP_BEEP, 120)
+    mainHandler.postDelayed(Runnable{ run = function() doResume() end }, 300)
   else
-    service.speak("Gagal melanjutkan rekaman: " .. tostring(err))
+    doResume()
   end
 end
 
@@ -1251,7 +1419,7 @@ showPauseDialog = function()
   }
 
   local builder = AlertDialog.Builder(service)
-    .setTitle("Rekaman Sedang Dijeda")
+    .setTitle("Rekaman Sedang Dijeda (" .. formatDuration(elapsedMs()) .. ")")
     .setItems(items, function(dialog, which)
       dialog.dismiss()
       if which == 0 then
@@ -1266,13 +1434,11 @@ showPauseDialog = function()
             clearAutoStopTimer()
             state.isRecording = false
             state.isPaused = false
+            state.accumMs = 0
             abandonRecorderAudioFocus()
             triggerVibration(1.2)
 
-            if state.agcEffect then
-              pcall(function() state.agcEffect.release() end)
-              state.agcEffect = nil
-            end
+            releaseEffects()
 
             if state.isWav then
               pcall(function()
@@ -1313,8 +1479,11 @@ showPauseDialog = function()
   displayOverlayDialog(builder)
 end
 
--- Mulai Perekaman Suara
-startRecording = function()
+-- Mulai Perekaman Suara (setelah hitung mundur selesai)
+local function doStartRecording()
+  state.isCountingDown = false
+  state.countdownRunnable = nil
+
   if state.isRecording then
     service.speak("Perekaman sudah aktif berjalan.")
     return
@@ -1391,9 +1560,27 @@ startRecording = function()
   local targetFile = File(getRecordingsDir(), prefix .. "_" .. timeStamp .. ext)
   state.currentFilePath = tostring(targetFile.getAbsolutePath())
 
-  local audioSourceId = MediaRecorder.AudioSource.MIC
-  if getNoiseReduction() then
-    audioSourceId = MediaRecorder.AudioSource.VOICE_RECOGNITION
+  -- Sumber suara: jenis mikrofon pilihan, dengan mikrofon biasa sebagai cadangan
+  local audioSourceId = getMicSourceId()
+  local sources = { audioSourceId }
+  if audioSourceId ~= 1 then table.insert(sources, 1) end
+  local usedFallback = false
+
+  local function finishStartMessage(label)
+    state.isRecording = true
+    state.isPaused = false
+    state.accumMs = 0
+    state.lastTick = SystemClock.elapsedRealtime()
+    setupAutoStopTimer()
+    triggerVibration(1.1)
+    local msg = label
+    if getRecordTimerSeconds() > 0 then
+      msg = msg .. " (Timer " .. formatTimerLabel(getRecordTimerSeconds()) .. ")"
+    end
+    if usedFallback then
+      msg = msg .. ". Jenis mikrofon pilihan tidak didukung, memakai mikrofon standar"
+    end
+    service.speak(msg)
   end
 
   -- Jalur WAV
@@ -1404,19 +1591,52 @@ startRecording = function()
     local audioEncoding = AudioFormat.ENCODING_PCM_16BIT
     local minBuf = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioEncoding)
     if minBuf <= 0 then minBuf = 4096 end
-    local bufSize = minBuf * 2
+    local bufSize = minBuf * math.max(1, math.floor(getBufferMult()))
+    local gainMult = 10 ^ (getInputGainDb() / 20)
 
     local ok, err = pcall(function()
-      state.audioRecord = AudioRecord(audioSourceId, sampleRate, channelConfig, audioEncoding, bufSize)
-      if state.audioRecord.getState() ~= AudioRecord.STATE_INITIALIZED then
+      local rec = nil
+      for idx, src in ipairs(sources) do
+        local okc, r = pcall(function()
+          return AudioRecord(src, sampleRate, channelConfig, audioEncoding, bufSize)
+        end)
+        if okc and r ~= nil and r.getState() == AudioRecord.STATE_INITIALIZED then
+          rec = r
+          usedFallback = (idx > 1)
+          break
+        end
+        if okc and r ~= nil then pcall(function() r.release() end) end
+      end
+      if rec == nil then
         error("Inisialisasi AudioRecord gagal.")
       end
+      state.audioRecord = rec
+
+      local sessionId = rec.getAudioSessionId()
 
       if getGainControl() then
         pcall(function()
           if AutomaticGainControl.isAvailable() then
-            state.agcEffect = AutomaticGainControl.create(state.audioRecord.getAudioSessionId())
+            state.agcEffect = AutomaticGainControl.create(sessionId)
             if state.agcEffect then state.agcEffect.setEnabled(true) end
+          end
+        end)
+      end
+
+      if getEchoCancel() then
+        pcall(function()
+          if AcousticEchoCanceler.isAvailable() then
+            state.aecEffect = AcousticEchoCanceler.create(sessionId)
+            if state.aecEffect then state.aecEffect.setEnabled(true) end
+          end
+        end)
+      end
+
+      if getNoiseReduction() then
+        pcall(function()
+          if NoiseSuppressor.isAvailable() then
+            state.nsEffect = NoiseSuppressor.create(sessionId)
+            if state.nsEffect then state.nsEffect.setEnabled(true) end
           end
         end)
       end
@@ -1425,11 +1645,12 @@ startRecording = function()
       state.pcmSampleRate = sampleRate
       state.pcmChannels = channels
       state.pcmTotalBytes = 0
-      state.audioRecord.startRecording()
+      rec.startRecording()
 
       state.recordThread = Thread(Runnable{
         run = function()
           local fos = nil
+          local gainActive = (math.abs(gainMult - 1) > 0.001)
           pcall(function()
             fos = FileOutputStream(File(state.currentFilePath))
             local headerPlaceholder
@@ -1446,20 +1667,30 @@ startRecording = function()
             end
 
             local totalBytes = 0
-            while state.isRecording and state.isWav do
-              if not state.isPaused then
-                local readBytes = state.audioRecord.read(pcmBuffer, 0, 4096)
-                if readBytes > 0 then
-                  fos.write(pcmBuffer, 0, readBytes)
-                  totalBytes = totalBytes + readBytes
-                  state.pcmTotalBytes = totalBytes
+            pcall(function()
+              while state.isRecording and state.isWav do
+                if not state.isPaused then
+                  local readBytes = rec.read(pcmBuffer, 0, 4096)
+                  if readBytes > 0 then
+                    if gainActive then
+                      local okg = pcall(applyGain, pcmBuffer, readBytes, gainMult)
+                      if not okg then gainActive = false end
+                    end
+                    fos.write(pcmBuffer, 0, readBytes)
+                    totalBytes = totalBytes + readBytes
+                    state.pcmTotalBytes = totalBytes
+                  end
+                else
+                  Thread.sleep(100)
                 end
-              else
-                Thread.sleep(100)
               end
+            end)
+          end)
+          pcall(function()
+            if fos then
+              fos.flush()
+              fos.close()
             end
-            fos.flush()
-            fos.close()
           end)
         end
       })
@@ -1467,17 +1698,10 @@ startRecording = function()
     end)
 
     if ok then
-      state.isRecording = true
-      state.isPaused = false
-      setupAutoStopTimer()
-      triggerVibration(1.1)
-      local msg = "Perekaman WAV Lossless dimulai"
-      if getRecordTimerSeconds() > 0 then
-        msg = msg .. " (Timer " .. math.floor(getRecordTimerSeconds() / 60) .. "m)"
-      end
-      service.speak(msg)
+      finishStartMessage("Perekaman WAV Lossless dimulai")
     else
       abandonRecorderAudioFocus()
+      releaseEffects()
       state.audioRecord = nil
       state.recordThread = nil
       state.isWav = false
@@ -1489,49 +1713,55 @@ startRecording = function()
   end
 
   -- Jalur MediaRecorder
-  local ok, err = pcall(function()
-    state.recorder = MediaRecorder()
-    state.isWav = false
+  local ok, err = nil, nil
+  for idx, src in ipairs(sources) do
+    ok, err = pcall(function()
+      state.recorder = MediaRecorder()
+      state.isWav = false
 
-    state.recorder.setAudioSource(audioSourceId)
-    state.recorder.setOutputFormat(outputFormat)
-    state.recorder.setAudioEncoder(audioEncoder)
+      state.recorder.setAudioSource(src)
+      state.recorder.setOutputFormat(outputFormat)
+      state.recorder.setAudioEncoder(audioEncoder)
 
-    if not customRate then
-      if fmt == "amr_wb" then
-        state.recorder.setAudioSamplingRate(16000)
+      if not customRate then
+        if fmt == "amr_wb" then
+          state.recorder.setAudioSamplingRate(16000)
+        else
+          state.recorder.setAudioSamplingRate(8000)
+        end
       else
-        state.recorder.setAudioSamplingRate(8000)
+        pcall(function() state.recorder.setAudioSamplingRate(math.floor(getAudioSampleRate())) end)
       end
-    else
-      pcall(function() state.recorder.setAudioSamplingRate(math.floor(getAudioSampleRate())) end)
+
+      if customBitrate then
+        pcall(function() state.recorder.setAudioEncodingBitRate(math.floor(getAudioBitrate())) end)
+      end
+
+      if not customChannels then
+        pcall(function() state.recorder.setAudioChannels(1) end)
+      else
+        pcall(function() state.recorder.setAudioChannels(math.floor(getAudioChannels())) end)
+      end
+
+      state.recorder.setOutputFile(state.currentFilePath)
+      state.recorder.prepare()
+      state.recorder.start()
+    end)
+
+    if ok then
+      usedFallback = (idx > 1)
+      break
     end
 
-    if customBitrate then
-      pcall(function() state.recorder.setAudioEncodingBitRate(math.floor(getAudioBitrate())) end)
-    end
-
-    if not customChannels then
-      pcall(function() state.recorder.setAudioChannels(1) end)
-    else
-      pcall(function() state.recorder.setAudioChannels(math.floor(getAudioChannels())) end)
-    end
-
-    state.recorder.setOutputFile(state.currentFilePath)
-    state.recorder.prepare()
-    state.recorder.start()
-  end)
+    pcall(function()
+      if state.recorder then state.recorder.release() end
+    end)
+    state.recorder = nil
+    pcall(function() File(state.currentFilePath).delete() end)
+  end
 
   if ok then
-    state.isRecording = true
-    state.isPaused = false
-    setupAutoStopTimer()
-    triggerVibration(1.1)
-    local msg = "Perekaman suara dimulai"
-    if getRecordTimerSeconds() > 0 then
-      msg = msg .. " (Timer " .. math.floor(getRecordTimerSeconds() / 60) .. "m)"
-    end
-    service.speak(msg)
+    finishStartMessage("Perekaman suara dimulai")
   else
     abandonRecorderAudioFocus()
     state.recorder = nil
@@ -1539,6 +1769,152 @@ startRecording = function()
     state.isPaused = false
     service.speak("Gagal memulai rekaman: " .. tostring(err))
   end
+end
+
+-- Mulai dengan bunyi penanda lebih dulu (dibunyikan sebelum rekaman agar tidak ikut terekam)
+local function beginWithBeep()
+  state.isCountingDown = true
+  if getBeep() then
+    beep(ToneGenerator.TONE_PROP_BEEP, 150)
+    state.countdownRunnable = Runnable{
+      run = function()
+        if state.isCountingDown then doStartRecording() end
+      end
+    }
+    mainHandler.postDelayed(state.countdownRunnable, 350)
+  else
+    doStartRecording()
+  end
+end
+
+local function cancelCountdown()
+  state.isCountingDown = false
+  if state.countdownRunnable then
+    pcall(function() mainHandler.removeCallbacks(state.countdownRunnable) end)
+    state.countdownRunnable = nil
+  end
+  triggerVibration(1.0)
+  service.speak("Hitung mundur dibatalkan.")
+end
+
+startRecording = function()
+  if state.isRecording then
+    service.speak("Perekaman sudah aktif berjalan.")
+    return
+  end
+  if state.isCountingDown then return end
+
+  local cd = getCountdownSeconds()
+  if cd <= 0 then
+    beginWithBeep()
+    return
+  end
+
+  state.isCountingDown = true
+  local remaining = cd
+  triggerVibration(1.0)
+  service.speak("Hitung mundur " .. cd .. " detik. Jalankan script lagi untuk membatalkan.")
+
+  local tick
+  tick = Runnable{
+    run = function()
+      if not state.isCountingDown then return end
+      remaining = remaining - 1
+      if remaining <= 0 then
+        beginWithBeep()
+        return
+      end
+      beep(ToneGenerator.TONE_PROP_BEEP, 80)
+      triggerVibration(0.5)
+      if remaining <= 3 then
+        service.speak(tostring(remaining))
+      end
+      state.countdownRunnable = tick
+      mainHandler.postDelayed(tick, 1000)
+    end
+  }
+  state.countdownRunnable = tick
+  mainHandler.postDelayed(tick, 1000)
+end
+
+-- Cek tingkat suara mikrofon (3 detik) untuk memastikan mikrofon menangkap suara
+checkMicLevel = function()
+  if state.isRecording or state.isCountingDown then
+    service.speak("Hentikan rekaman atau hitung mundur dulu sebelum mengecek mikrofon.")
+    return
+  end
+  if state.isTestingMic then return end
+  state.isTestingMic = true
+  service.speak("Mengecek mikrofon. Bicaralah selama tiga detik.")
+
+  Thread(Runnable{
+    run = function()
+      local peak = 0
+      local ok = pcall(function()
+        local sr = 16000
+        local minBuf = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if minBuf <= 0 then minBuf = 4096 end
+
+        local rec = nil
+        local srcList = { getMicSourceId(), 1 }
+        for _, src in ipairs(srcList) do
+          local okc, r = pcall(function()
+            return AudioRecord(src, sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 2)
+          end)
+          if okc and r ~= nil and r.getState() == AudioRecord.STATE_INITIALIZED then
+            rec = r
+            break
+          end
+          if okc and r ~= nil then pcall(function() r.release() end) end
+        end
+        if rec == nil then error("mikrofon tidak bisa dibuka") end
+
+        local buf
+        pcall(function() buf = byte[2048] end)
+        if not buf then buf = Array.newInstance(Byte.TYPE, 2048) end
+
+        rec.startRecording()
+        local t0 = SystemClock.elapsedRealtime()
+        while SystemClock.elapsedRealtime() - t0 < 3000 do
+          local n = rec.read(buf, 0, 2048)
+          if n > 0 then
+            for i = 0, n - 2, 2 do
+              local lo = buf[i]
+              local hi = buf[i + 1]
+              if lo < 0 then lo = lo + 256 end
+              local s = math.abs(hi * 256 + lo)
+              if s > peak then peak = s end
+            end
+          end
+        end
+        pcall(function() rec.stop() end)
+        rec.release()
+      end)
+
+      mainHandler.post(Runnable{
+        run = function()
+          state.isTestingMic = false
+          if not ok then
+            service.speak("Gagal mengecek mikrofon. Pastikan izin mikrofon aktif.")
+            return
+          end
+          local pct = math.floor(peak / 32768 * 100 + 0.5)
+          local verdict
+          if pct < 3 then
+            verdict = "Hampir senyap. Mikrofon mungkin tidak menangkap suara, coba ganti jenis mikrofon."
+          elseif pct < 20 then
+            verdict = "Terlalu pelan. Dekatkan mikrofon atau naikkan penguatan suara."
+          elseif pct <= 85 then
+            verdict = "Tingkat suara baik."
+          else
+            verdict = "Terlalu keras, suara bisa pecah. Jauhkan mikrofon atau turunkan penguatan."
+          end
+          triggerVibration(1.0)
+          service.speak("Puncak suara " .. pct .. " persen. " .. verdict)
+        end
+      })
+    end
+  }).start()
 end
 
 -- Dialog Format Audio
@@ -1593,9 +1969,10 @@ showBitrateDialog = function()
     "192 kbps (Tinggi)",
     "128 kbps (Standar)",
     "96 kbps (Sedang)",
-    "64 kbps (Hemat Ruang)"
+    "64 kbps (Hemat Ruang)",
+    "48 kbps (Paling Hemat)"
   }
-  local values = {320000, 256000, 192000, 128000, 96000, 64000}
+  local values = {320000, 256000, 192000, 128000, 96000, 64000, 48000}
   local current = getAudioBitrate()
   local selIndex = 3
 
@@ -1627,11 +2004,13 @@ showSampleRateDialog = function()
   local options = {
     "48 kHz (Kualitas Studio)",
     "44.1 kHz (Kualitas CD / Standar)",
+    "32 kHz (Siaran)",
     "22.05 kHz (Sedang)",
     "16 kHz (Standar Bicara)",
+    "11.025 kHz (Ringan)",
     "8 kHz (Kualitas Telepon)"
   }
-  local values = {48000, 44100, 22050, 16000, 8000}
+  local values = {48000, 44100, 32000, 22050, 16000, 11025, 8000}
   local current = getAudioSampleRate()
   local selIndex = 1
 
@@ -1685,29 +2064,128 @@ showChannelsDialog = function()
   displayOverlayDialog(builder)
 end
 
+-- Dialog Jenis Mikrofon
+showMicTypeDialog = function()
+  local options = {}
+  local selIndex = 0
+  local current = getMicType()
+  for i, m in ipairs(MIC_TYPES) do
+    table.insert(options, i .. ". " .. m.label)
+    if m.key == current then selIndex = i - 1 end
+  end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Pilih Jenis Mikrofon")
+    .setSingleChoiceItems(options, selIndex, function(dialog, which)
+      dialog.dismiss()
+      local chosen = MIC_TYPES[which + 1]
+      setMicType(chosen.key)
+      triggerVibration(1.0)
+      service.speak("Jenis mikrofon diatur ke " .. chosen.label)
+      if chosen.key == "unprocessed" and Build.VERSION.SDK_INT < 24 then
+        service.speak("HP ini belum mendukung mikrofon mentah, akan dipakai mikrofon standar.")
+      end
+      showSettingsDialog()
+    end)
+    .setNegativeButton("Kembali", function()
+      showSettingsDialog()
+    end)
+
+  displayOverlayDialog(builder)
+end
+
+-- Dialog Penguatan Suara Masuk (Gain)
+showInputGainDialog = function()
+  local values = {-6, -3, 0, 3, 6, 9, 12, 15, 18, 21, 24}
+  local options = {}
+  local selIndex = 2
+  local current = getInputGainDb()
+  for i, v in ipairs(values) do
+    local label
+    if v == 0 then
+      label = "0 dB (Normal)"
+    elseif v > 0 then
+      label = "+" .. v .. " dB"
+    else
+      label = v .. " dB"
+    end
+    table.insert(options, label)
+    if tonumber(v) == tonumber(current) then selIndex = i - 1 end
+  end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Penguatan Suara Masuk (hanya format WAV)")
+    .setSingleChoiceItems(options, selIndex, function(dialog, which)
+      dialog.dismiss()
+      setInputGainDb(values[which + 1])
+      triggerVibration(1.0)
+      service.speak("Penguatan suara masuk diatur ke " .. options[which + 1])
+      if getAudioFormat() ~= "wav" and values[which + 1] ~= 0 then
+        service.speak("Penguatan ini baru berlaku bila format berkas WAV.")
+      end
+      showSettingsDialog()
+    end)
+    .setNegativeButton("Kembali", function()
+      showSettingsDialog()
+    end)
+
+  displayOverlayDialog(builder)
+end
+
 -- Dialog Prefix
 showPrefixDialog = function()
-  local prefixes = {"1. REC", "2. Catatan", "3. Wawancara", "4. Kuliah", "5. Suara", "6. Musik"}
   local values = {"REC", "Catatan", "Wawancara", "Kuliah", "Suara", "Musik"}
   local current = getRecordPrefix()
-  local selIndex = 0
+  local selIndex = -1
+  local prefixes = {}
 
   for i, v in ipairs(values) do
-    if v == current then
-      selIndex = i - 1
-      break
-    end
+    table.insert(prefixes, i .. ". " .. v)
+    if v == current then selIndex = i - 1 end
   end
+
+  local customLabel = "7. Ketik sendiri..."
+  if selIndex == -1 then
+    customLabel = "7. Ketik sendiri... (Aktif: " .. current .. ")"
+    selIndex = 6
+  end
+  table.insert(prefixes, customLabel)
 
   local builder = AlertDialog.Builder(service)
     .setTitle("Pilih Awalan Nama Berkas")
     .setSingleChoiceItems(prefixes, selIndex, function(dialog, which)
       dialog.dismiss()
-      local chosen = values[which + 1]
-      setRecordPrefix(chosen)
-      triggerVibration(1.0)
-      service.speak("Awalan nama berkas diatur ke " .. chosen)
-      showSettingsDialog()
+      if which < #values then
+        local chosen = values[which + 1]
+        setRecordPrefix(chosen)
+        triggerVibration(1.0)
+        service.speak("Awalan nama berkas diatur ke " .. chosen)
+        showSettingsDialog()
+      else
+        local input = EditText(service)
+        input.setHint("Ketik awalan nama berkas...")
+        input.setText(current)
+        input.selectAll()
+        local inputBuilder = AlertDialog.Builder(service)
+          .setTitle("Awalan Nama Berkas")
+          .setView(input)
+          .setPositiveButton("Simpan", function()
+            local typed = tostring(input.getText())
+            typed = typed:gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", "_"):gsub("[^%w_%-]", "")
+            if typed == "" then
+              service.speak("Awalan tidak valid, tidak diubah.")
+            else
+              setRecordPrefix(typed)
+              triggerVibration(1.0)
+              service.speak("Awalan nama berkas diatur ke " .. typed)
+            end
+            showSettingsDialog()
+          end)
+          .setNegativeButton("Batal", function()
+            showSettingsDialog()
+          end)
+        displayOverlayDialog(inputBuilder)
+      end
     end)
     .setNegativeButton("Kembali", function()
       showSettingsDialog()
@@ -1768,16 +2246,115 @@ showGainControlDialog = function()
   displayOverlayDialog(builder)
 end
 
+-- Dialog Peredam Gema
+showEchoCancelDialog = function()
+  local options = {
+    "Aktif (Kurangi Gema dari Pengeras Suara, format WAV)",
+    "Nonaktif"
+  }
+  local isEnabled = getEchoCancel()
+  local selIndex = isEnabled and 0 or 1
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Peredam Gema (Echo Canceler)")
+    .setSingleChoiceItems(options, selIndex, function(dialog, which)
+      dialog.dismiss()
+      local enable = (which == 0)
+      setEchoCancel(enable)
+      triggerVibration(1.0)
+      service.speak("Peredam gema " .. (enable and "diaktifkan" or "dinonaktifkan"))
+      showSettingsDialog()
+    end)
+    .setNegativeButton("Kembali", function()
+      showSettingsDialog()
+    end)
+
+  displayOverlayDialog(builder)
+end
+
+-- Dialog Ukuran Penyangga Mikrofon
+showBufferDialog = function()
+  local options = {
+    "1x (Terkecil, risiko suara putus-putus)",
+    "2x (Standar)",
+    "4x (Lebih aman)",
+    "8x (Paling aman, jeda lebih besar)"
+  }
+  local values = {1, 2, 4, 8}
+  local current = getBufferMult()
+  local selIndex = 1
+
+  for i, v in ipairs(values) do
+    if tonumber(v) == tonumber(current) then
+      selIndex = i - 1
+      break
+    end
+  end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Ukuran Penyangga Mikrofon (format WAV)")
+    .setSingleChoiceItems(options, selIndex, function(dialog, which)
+      dialog.dismiss()
+      setBufferMult(values[which + 1])
+      triggerVibration(1.0)
+      service.speak("Ukuran penyangga diatur ke " .. options[which + 1])
+      showSettingsDialog()
+    end)
+    .setNegativeButton("Kembali", function()
+      showSettingsDialog()
+    end)
+
+  displayOverlayDialog(builder)
+end
+
+-- Dialog Hitung Mundur Sebelum Rekam
+showCountdownDialog = function()
+  local options = {
+    "1. Nonaktif (Langsung Rekam)",
+    "2. 3 Detik",
+    "3. 5 Detik",
+    "4. 10 Detik"
+  }
+  local values = {0, 3, 5, 10}
+  local current = getCountdownSeconds()
+  local selIndex = 0
+
+  for i, v in ipairs(values) do
+    if tonumber(v) == tonumber(current) then
+      selIndex = i - 1
+      break
+    end
+  end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Hitung Mundur Sebelum Rekam")
+    .setSingleChoiceItems(options, selIndex, function(dialog, which)
+      dialog.dismiss()
+      setCountdownSeconds(values[which + 1])
+      triggerVibration(1.0)
+      local chosen = values[which + 1]
+      service.speak("Hitung mundur " .. (chosen == 0 and "dinonaktifkan" or (chosen .. " detik")))
+      showSettingsDialog()
+    end)
+    .setNegativeButton("Kembali", function()
+      showSettingsDialog()
+    end)
+
+  displayOverlayDialog(builder)
+end
+
 -- Dialog Timer Rekaman Otomatis
 showRecordTimerDialog = function()
   local timerOptions = {
     "1. Nonaktif (Rekam Manual Tanpa Batas)",
     "2. 5 Menit",
-    "3. 15 Menit",
-    "4. 30 Menit",
-    "5. 60 Menit (1 Jam)"
+    "3. 10 Menit",
+    "4. 15 Menit",
+    "5. 30 Menit",
+    "6. 60 Menit (1 Jam)",
+    "7. 2 Jam"
   }
-  local values = {0, 300, 900, 1800, 3600}
+  local values = {0, 300, 600, 900, 1800, 3600, 7200}
   local currentSec = getRecordTimerSeconds()
   local selIndex = 0
 
@@ -1795,7 +2372,7 @@ showRecordTimerDialog = function()
       local chosenSec = values[which + 1]
       setRecordTimerSeconds(chosenSec)
       triggerVibration(1.0)
-      local label = (chosenSec == 0 and "dinonaktifkan") or (math.floor(chosenSec / 60) .. " menit")
+      local label = (chosenSec == 0 and "dinonaktifkan") or formatTimerLabel(chosenSec)
       service.speak("Timer rekaman otomatis " .. label)
       showSettingsDialog()
     end)
@@ -1824,6 +2401,37 @@ showStopBehaviorDialog = function()
       triggerVibration(1.0)
       local label = (which == 1) and "Terjeda Dulu" or "Langsung Berhenti"
       service.speak("Aksi penghentian diatur ke " .. label)
+      showSettingsDialog()
+    end)
+    .setNegativeButton("Kembali", function()
+      showSettingsDialog()
+    end)
+
+  displayOverlayDialog(builder)
+end
+
+-- Dialog Bunyi Penanda & Bacakan Durasi
+showBeepDialog = function()
+  local options = {
+    "1. Bunyi penanda aktif + bacakan durasi",
+    "2. Bunyi penanda aktif saja",
+    "3. Bacakan durasi saja",
+    "4. Keduanya nonaktif"
+  }
+  local selIndex
+  if getBeep() and getAnnounceDuration() then selIndex = 0
+  elseif getBeep() then selIndex = 1
+  elseif getAnnounceDuration() then selIndex = 2
+  else selIndex = 3 end
+
+  local builder = AlertDialog.Builder(service)
+    .setTitle("Bunyi Penanda & Durasi")
+    .setSingleChoiceItems(options, selIndex, function(dialog, which)
+      dialog.dismiss()
+      setBeep(which == 0 or which == 1)
+      setAnnounceDuration(which == 0 or which == 2)
+      triggerVibration(1.0)
+      service.speak("Pengaturan diubah: " .. options[which + 1]:gsub("^%d+%.%s*", ""))
       showSettingsDialog()
     end)
     .setNegativeButton("Kembali", function()
@@ -1899,30 +2507,45 @@ showSettingsDialog = function()
   local fmtName = fmtLabels[curFmt] or curFmt:upper()
   local kbps = (curFmt == "wav") and "Uncompressed (PCM)" or (math.floor(getAudioBitrate() / 1000) .. " kbps")
   local khzVal = getAudioSampleRate() / 1000
-  local khz = (khzVal == math.floor(khzVal) and string.format("%d", khzVal) or string.format("%.1f", khzVal)) .. " kHz"
+  local khz = (khzVal == math.floor(khzVal) and string.format("%d", khzVal) or string.format("%g", khzVal)) .. " kHz"
   local chName = (getAudioChannels() == 2) and "Stereo (2 Ch)" or "Mono (1 Ch)"
   local prefixName = getRecordPrefix()
 
   local noiseLabel = getNoiseReduction() and "Aktif" or "Nonaktif"
   local gainLabel = getGainControl() and "Aktif (AGC)" or "Nonaktif"
-  local timerSec = getRecordTimerSeconds()
-  local timerLabel = (timerSec == 0 and "Nonaktif") or (math.floor(timerSec / 60) .. " Menit")
+  local echoLabel = getEchoCancel() and "Aktif" or "Nonaktif"
+  local timerLabel = formatTimerLabel(getRecordTimerSeconds())
   local stopBehaviorLabel = (getStopBehavior() == "pause") and "Terjeda Dulu" or "Langsung Berhenti"
   local vibLevel = getVibrationLevel()
+
+  local micLabel = getMicLabel(getMicType())
+  local gainDb = getInputGainDb()
+  local gainDbLabel = (gainDb == 0 and "0 dB") or ((gainDb > 0 and "+" or "") .. gainDb .. " dB")
+  local bufferLabel = math.floor(getBufferMult()) .. "x"
+  local countdownLabel = (getCountdownSeconds() == 0) and "Nonaktif" or (math.floor(getCountdownSeconds()) .. " detik")
+  local beepLabel = getBeep() and "Bunyi aktif" or "Bunyi nonaktif"
+  local durLabel = getAnnounceDuration() and "bacakan durasi" or "tanpa durasi"
 
   local settingsItems = {
     "1. Format Berkas (Aktif: " .. fmtName .. ")",
     "2. Laju Bit / Bitrate (Aktif: " .. kbps .. ")",
     "3. Frekuensi Sampel (Aktif: " .. khz .. ")",
     "4. Saluran Audio (Aktif: " .. chName .. ")",
-    "5. Awalan Nama Berkas (Aktif: " .. prefixName .. "_)",
-    "6. Peredam Bising (Aktif: " .. noiseLabel .. ")",
-    "7. Gain Control / AGC (Aktif: " .. gainLabel .. ")",
-    "8. Timer Batas Rekam (Aktif: " .. timerLabel .. ")",
-    "9. Aksi Penghentian (Aktif: " .. stopBehaviorLabel .. ")",
-    "10. Intensitas Getaran (Aktif: " .. vibLevel .. ")",
-    "11. Periksa Versi Baru",
-    "12. Reset Semua Pengaturan ke Default"
+    "5. Jenis Mikrofon (Aktif: " .. micLabel .. ")",
+    "6. Penguatan Suara Masuk, format WAV (Aktif: " .. gainDbLabel .. ")",
+    "7. Awalan Nama Berkas (Aktif: " .. prefixName .. "_)",
+    "8. Peredam Bising (Aktif: " .. noiseLabel .. ")",
+    "9. Gain Control / AGC (Aktif: " .. gainLabel .. ")",
+    "10. Peredam Gema, format WAV (Aktif: " .. echoLabel .. ")",
+    "11. Ukuran Penyangga Mikrofon, format WAV (Aktif: " .. bufferLabel .. ")",
+    "12. Hitung Mundur Sebelum Rekam (Aktif: " .. countdownLabel .. ")",
+    "13. Timer Batas Rekam (Aktif: " .. timerLabel .. ")",
+    "14. Aksi Penghentian (Aktif: " .. stopBehaviorLabel .. ")",
+    "15. Bunyi Penanda & Durasi (Aktif: " .. beepLabel .. ", " .. durLabel .. ")",
+    "16. Intensitas Getaran (Aktif: " .. vibLevel .. ")",
+    "17. Cek Tingkat Suara Mikrofon (3 detik)",
+    "18. Periksa Versi Baru",
+    "19. Reset Semua Pengaturan ke Default"
   }
 
   local builder = AlertDialog.Builder(service)
@@ -1934,14 +2557,21 @@ showSettingsDialog = function()
       elseif which == 1 then showBitrateDialog()
       elseif which == 2 then showSampleRateDialog()
       elseif which == 3 then showChannelsDialog()
-      elseif which == 4 then showPrefixDialog()
-      elseif which == 5 then showNoiseReductionDialog()
-      elseif which == 6 then showGainControlDialog()
-      elseif which == 7 then showRecordTimerDialog()
-      elseif which == 8 then showStopBehaviorDialog()
-      elseif which == 9 then showVibrationDialog()
-      elseif which == 10 then checkForUpdate()
-      elseif which == 11 then showResetConfirmDialog()
+      elseif which == 4 then showMicTypeDialog()
+      elseif which == 5 then showInputGainDialog()
+      elseif which == 6 then showPrefixDialog()
+      elseif which == 7 then showNoiseReductionDialog()
+      elseif which == 8 then showGainControlDialog()
+      elseif which == 9 then showEchoCancelDialog()
+      elseif which == 10 then showBufferDialog()
+      elseif which == 11 then showCountdownDialog()
+      elseif which == 12 then showRecordTimerDialog()
+      elseif which == 13 then showStopBehaviorDialog()
+      elseif which == 14 then showBeepDialog()
+      elseif which == 15 then showVibrationDialog()
+      elseif which == 16 then checkMicLevel()
+      elseif which == 17 then checkForUpdate()
+      elseif which == 18 then showResetConfirmDialog()
       end
     end)
     .setNegativeButton("Tutup", nil)
@@ -1952,7 +2582,9 @@ end
 -- ====================================================================
 -- ALUR EKSEKUSI
 -- ====================================================================
-if state.isRecording then
+if state.isCountingDown then
+  cancelCountdown()
+elseif state.isRecording then
   if state.isPaused then
     showPauseDialog()
   elseif getStopBehavior() == "pause" then
